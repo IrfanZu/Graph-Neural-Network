@@ -1,0 +1,37 @@
+# ==============================
+# 1️⃣ Clean start
+# ==============================
+!pip uninstall -y torch torchvision torchaudio transformers accelerate sentence-transformers peft huggingface-hub tqdm scipy scikit-learn umap-learn tsfresh datasets diffusers gradio fsspec gcsfs bigframes
+
+# ==============================
+# 2️⃣ Core dependencies
+# ==============================
+!pip install numpy==1.26.4
+!pip install "scipy>=1.14.1"
+!pip install "scikit-learn>=1.6.0"
+!pip install "tqdm>=4.66.4"
+
+# ==============================
+# 3️⃣ PyTorch (CUDA 12.1 — stable Colab version)
+# ==============================
+!pip install torch==2.3.0+cu121 torchvision==0.18.0+cu121 torchaudio==2.3.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+
+# ==============================
+# 4️⃣ PyTorch Geometric & Dependencies
+# ==============================
+# Install core PyG packages (must match Torch 2.3 + CUDA 12.1)
+!pip install torch-scatter -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+!pip install torch-sparse -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+!pip install torch-cluster -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+!pip install torch-spline-conv -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+!pip install torch-geometric==2.5.3 -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+
+# ==============================
+# 5️⃣ Hugging Face + Ecosystem
+# ==============================
+!pip install transformers==4.40.2 sentence-transformers==2.7.0 peft==0.11.1 accelerate==0.31.0 "huggingface-hub>=0.23.0" datasets==2.19.1
+
+# ==============================
+# ✅ Done
+# ==============================
+!echo "All libraries installed successfully"
