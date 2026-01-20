@@ -1,0 +1,145 @@
+# =====================================
+# TABULAR DATA → HETERO GNN GRAPH + SUBSET VISUALIZATION
+# =====================================
+
+import pandas as pd
+import torch
+from torch_geometric.data import HeteroData
+from transformers import DistilBertTokenizer, DistilBertModel
+from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
+import networkx as nx
+import matplotlib.pyplot as plt
+import random
+import matplotlib.patches as mpatches
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------------------------
+# LOAD TABULAR DATA
+# -------------------------------------
+df = pd.read_csv("/content/drive/MyDrive/Colab Notebooks/MIZ Dataset.csv")
+
+# -------------------------------------
+# LABEL (binary: 0 = Real Information, 1 = Disinformation)
+# -------------------------------------
+df['label'] = df['Disinformation'].astype(int)
+
+# -------------------------------------
+# ENCODE PROPAGATION SOURCE
+# -------------------------------------
+source_encoder = LabelEncoder()
+df['source_id'] = source_encoder.fit_transform(df['Propagation Source'].fillna("Unknown"))
+
+# -------------------------------------
+# ARTICLE TYPE AS NODE FEATURE
+# -------------------------------------
+type_encoder = LabelEncoder()
+df['article_type_id'] = type_encoder.fit_transform(df['Article Type'].fillna("Unknown"))
+
+# -------------------------------------
+# DISTILBERT EMBEDDINGS
+# -------------------------------------
+tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-multilingual-cased")
+bert = DistilBertModel.from_pretrained("distilbert-base-multilingual-cased").to(device)
+bert.eval()
+
+def encode(text):
+    inputs = tokenizer(
+        str(text),
+        truncation=True,
+        padding=True,
+        max_length=256,
+        return_tensors="pt"
+    ).to(device)
+    with torch.no_grad():
+        out = bert(**inputs)
+        emb = out.last_hidden_state.mean(dim=1)
+    return emb.squeeze(0).cpu()
+
+print("Encoding articles with DistilBERT...")
+embeddings = []
+for text in tqdm(df['Article'], desc="Encoding articles"):
+    embeddings.append(encode(text))
+x_text = torch.stack(embeddings)
+
+# Concatenate article type as feature
+x_type = torch.tensor(df['article_type_id'].values).unsqueeze(1).float()
+x = torch.cat([x_text, x_type], dim=1)
+
+# -------------------------------------
+# BUILD HETEROGENEOUS GRAPH
+# -------------------------------------
+data = HeteroData()
+data['article'].x = x
+data['article'].y = torch.tensor(df['label'].values, dtype=torch.long)
+num_nodes = len(df)
+
+# -------------------------------------
+# PROPAGATION EDGES
+# -------------------------------------
+src, dst = [], []
+for sid in df['source_id'].unique():
+    idx = df[df['source_id'] == sid].index.tolist()
+    for i in range(len(idx)):
+        for j in range(i + 1, len(idx)):
+            src += [idx[i], idx[j]]
+            dst += [idx[j], idx[i]]
+data['article', 'propagates', 'article'].edge_index = torch.tensor([src, dst], dtype=torch.long)
+
+# -------------------------------------
+# SELF-LOOPS
+# -------------------------------------
+loops = torch.arange(num_nodes)
+data['article', 'self_loop', 'article'].edge_index = torch.stack([loops, loops])
+
+# -------------------------------------
+# SAVE GRAPH
+# -------------------------------------
+torch.save(data, "/content/drive/MyDrive/Colab Notebooks/hadith_graphs/hetero_gat_graph.pt")
+print("✅ Heterogeneous graph saved as hetero_gnn_graph.pt")
+
+# =====================================
+# VISUALIZE SUBSET OF GRAPH (200 NODES MAX)
+# =====================================
+print("Building NetworkX graph for visualization...")
+
+G = nx.DiGraph()
+
+# Add nodes
+for idx, row in df.iterrows():
+    G.add_node(idx, label=row['label'], article_type=row['Article Type'])
+
+# Add edges
+for s, d in zip(src, dst):
+    G.add_edge(s, d)
+
+# Select subset to plot
+subset_size = min(200, num_nodes)
+subset_nodes = random.sample(list(G.nodes), subset_size)
+G_sub = G.subgraph(subset_nodes)
+
+# Layout
+pos = nx.spring_layout(G_sub, seed=42, k=0.25)
+
+# Node colors based on label
+node_colors = ['red' if G_sub.nodes[n]['label']==1 else 'blue' for n in G_sub.nodes]
+
+plt.figure(figsize=(12, 8))
+nx.draw(
+    G_sub, pos,
+    node_color=node_colors,
+    node_size=60,
+    alpha=0.8,
+    edge_color='gray',
+    width=0.5
+)
+
+# Legend
+legend_elements = [
+    mpatches.Patch(color='red', label='Disinformation'),
+    mpatches.Patch(color='blue', label='Real Information')
+]
+plt.legend(handles=legend_elements)
+plt.title(f"Article Propagation Graph (Subset of {subset_size} nodes)")
+plt.show()
