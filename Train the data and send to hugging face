@@ -1,0 +1,281 @@
+# =====================================
+# HETERO GAT MINI-BATCH TRAINING WITH WANDB (OVERFITTING REDUCTION)
+# =====================================
+
+import os
+os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
+
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import HeteroConv, GATConv
+from torch_geometric.loader import NeighborLoader
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import wandb
+import gc
+
+# =====================================
+# CLEAR MEMORY
+# =====================================
+torch.cuda.empty_cache()
+gc.collect()
+
+# =====================================
+# DEVICE
+# =====================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Available GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+
+# =====================================
+# WANDB INIT
+# =====================================
+wandb.init(
+    project="hetero-gat-minibatch",
+    name="hetero-gat-mini-batch-regularized",
+    config={
+        "model": "HeteroGAT-MiniBatch",
+        "hidden_dim": 64,
+        "heads": 2,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "dropout": 0.3,
+        "epochs": 50,
+        "batch_size": 128,
+        "optimizer": "Adam",
+        "task": "Node Classification",
+        "early_stop_patience": 5
+    }
+)
+
+# =====================================
+# LOAD GRAPH DATA
+# =====================================
+GRAPH_PATH = "/content/drive/MyDrive/Colab Notebooks/hadith_graphs/hetero_gat_graph.pt"
+data = torch.load(GRAPH_PATH, map_location='cpu')
+data = data.to(device)
+num_nodes = data['article'].num_nodes
+
+# =====================================
+# EXPLICIT INPUT DIMENSION
+# =====================================
+IN_DIM = 769  # Must match training input dimension
+HIDDEN_DIM = 64
+HEADS = 2
+DROPOUT = 0.3
+
+print(f"✅ Input feature dimension (in_dim) for 'article' nodes: {IN_DIM}")
+
+# =====================================
+# CREATE MASKS (70/15/15)
+# =====================================
+perm = torch.randperm(num_nodes)
+train_size = int(0.7 * num_nodes)
+val_size   = int(0.15 * num_nodes)
+
+train_idx = perm[:train_size]
+val_idx   = perm[train_size:train_size + val_size]
+test_idx  = perm[train_size + val_size:]
+
+mask = lambda idx: torch.zeros(num_nodes, dtype=torch.bool).scatter_(0, idx, True)
+data['article'].train_mask = mask(train_idx)
+data['article'].val_mask   = mask(val_idx)
+data['article'].test_mask  = mask(test_idx)
+
+print(f"Dataset split: Train={train_size}, Val={val_size}, Test={len(test_idx)}")
+
+# =====================================
+# HETERO GAT MODEL
+# =====================================
+class HeteroGATMiniBatch(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = HeteroConv({
+            ('article', 'propagates', 'article'): GATConv(IN_DIM, HIDDEN_DIM, heads=HEADS, dropout=DROPOUT),
+            ('article', 'self_loop', 'article'): GATConv(IN_DIM, HIDDEN_DIM, heads=HEADS, dropout=DROPOUT)
+        }, aggr='sum')
+
+        self.conv2 = HeteroConv({
+            ('article', 'propagates', 'article'): GATConv(HIDDEN_DIM * HEADS, HIDDEN_DIM, heads=1, dropout=DROPOUT),
+            ('article', 'self_loop', 'article'): GATConv(HIDDEN_DIM * HEADS, HIDDEN_DIM, heads=1, dropout=DROPOUT)
+        }, aggr='sum')
+
+        self.dropout = torch.nn.Dropout(DROPOUT)
+        self.classifier = torch.nn.Linear(HIDDEN_DIM, 2)
+
+    def forward(self, x_dict, edge_index_dict):
+        x_dict = self.conv1(x_dict, edge_index_dict)
+        x_dict = {k: F.elu(v) for k, v in x_dict.items()}
+        x_dict = self.conv2(x_dict, edge_index_dict)
+        x = self.dropout(x_dict['article'])
+        return self.classifier(x)
+
+# =====================================
+# NEIGHBOR LOADER FOR MINI-BATCH
+# =====================================
+num_neighbors = {key: [5, 5] for key in data.edge_types}  # smaller neighborhoods
+
+train_loader = NeighborLoader(
+    data,
+    num_neighbors=num_neighbors,
+    input_nodes=('article', data['article'].train_mask),
+    batch_size=wandb.config.batch_size,
+    shuffle=True
+)
+
+val_loader = NeighborLoader(
+    data,
+    num_neighbors=num_neighbors,
+    input_nodes=('article', data['article'].val_mask),
+    batch_size=wandb.config.batch_size,
+    shuffle=False
+)
+
+test_loader = NeighborLoader(
+    data,
+    num_neighbors=num_neighbors,
+    input_nodes=('article', data['article'].test_mask),
+    batch_size=wandb.config.batch_size,
+    shuffle=False
+)
+
+# =====================================
+# INIT MODEL
+# =====================================
+model = HeteroGATMiniBatch().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.lr, weight_decay=wandb.config.weight_decay)
+criterion = torch.nn.CrossEntropyLoss()
+
+# =====================================
+# TRAIN LOOP WITH EARLY STOPPING
+# =====================================
+best_val_f1 = 0.0
+epochs_no_improve = 0
+best_model_path = "/content/drive/MyDrive/Colab Notebooks/best_hadith_minibatch_regularized.pth"
+
+for epoch in range(1, wandb.config.epochs + 1):
+    # ---- TRAIN ----
+    model.train()
+    train_preds_list, train_labels_list = [], []
+    train_loss_total = 0
+
+    for batch in train_loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        out = model(batch.x_dict, batch.edge_index_dict)
+        loss = criterion(out, batch['article'].y)
+        loss.backward()
+        optimizer.step()
+
+        train_loss_total += loss.item() * batch['article'].y.size(0)
+        train_preds_list.append(out.argmax(dim=1).cpu())
+        train_labels_list.append(batch['article'].y.cpu())
+
+        del batch, out
+        torch.cuda.empty_cache()
+
+    train_labels_all = torch.cat(train_labels_list)
+    train_preds_all = torch.cat(train_preds_list)
+
+    # ---- TRAIN METRICS ----
+    train_loss = train_loss_total / len(train_loader.dataset)
+    train_acc  = accuracy_score(train_labels_all, train_preds_all)
+    train_prec = precision_score(train_labels_all, train_preds_all, zero_division=0)
+    train_rec  = recall_score(train_labels_all, train_preds_all, zero_division=0)
+    train_f1   = f1_score(train_labels_all, train_preds_all, zero_division=0)
+
+    # ---- VALIDATION ----
+    model.eval()
+    val_preds_list, val_labels_list = [], []
+    val_loss_total = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = batch.to(device)
+            out = model(batch.x_dict, batch.edge_index_dict)
+            loss = criterion(out, batch['article'].y)
+            val_loss_total += loss.item() * batch['article'].y.size(0)
+            val_preds_list.append(out.argmax(dim=1).cpu())
+            val_labels_list.append(batch['article'].y.cpu())
+            del batch, out
+            torch.cuda.empty_cache()
+
+    val_labels_all = torch.cat(val_labels_list)
+    val_preds_all = torch.cat(val_preds_list)
+
+    # ---- VALIDATION METRICS ----
+    val_loss = val_loss_total / len(val_loader.dataset)
+    val_acc  = accuracy_score(val_labels_all, val_preds_all)
+    val_prec = precision_score(val_labels_all, val_preds_all, zero_division=0)
+    val_rec  = recall_score(val_labels_all, val_preds_all, zero_division=0)
+    val_f1   = f1_score(val_labels_all, val_preds_all, zero_division=0)
+
+    # ---- WANDB LOGGING ----
+    wandb.log({
+        "epoch": epoch,
+        # Train metrics
+        "train/loss": train_loss,
+        "train/accuracy": train_acc,
+        "train/precision": train_prec,
+        "train/recall": train_rec,
+        "train/f1": train_f1,
+        # Validation metrics
+        "val/loss": val_loss,
+        "val/accuracy": val_acc,
+        "val/precision": val_prec,
+        "val/recall": val_rec,
+        "val/f1": val_f1
+    })
+
+    # ---- EARLY STOPPING & SAVE BEST MODEL ----
+    if val_f1 > best_val_f1:
+        best_val_f1 = val_f1
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), best_model_path)
+        wandb.run.summary["best_val_f1"] = best_val_f1
+        print(f"💾 Epoch {epoch}: New best model saved (Val F1={val_f1:.4f})")
+    else:
+        epochs_no_improve += 1
+
+    if epochs_no_improve >= wandb.config.early_stop_patience:
+        print(f"⏹ Early stopping triggered at epoch {epoch}")
+        break
+
+# =====================================
+# FINAL TEST EVALUATION
+# =====================================
+model.load_state_dict(torch.load(best_model_path))
+model.eval()
+
+test_preds_list, test_labels_list = [], []
+with torch.no_grad():
+    for batch in test_loader:
+        batch = batch.to(device)
+        out = model(batch.x_dict, batch.edge_index_dict)
+        test_preds_list.append(out.argmax(dim=1).cpu())
+        test_labels_list.append(batch['article'].y.cpu())
+        del batch, out
+        torch.cuda.empty_cache()
+
+test_preds_all = torch.cat(test_preds_list)
+test_labels_all = torch.cat(test_labels_list)
+
+test_acc  = accuracy_score(test_labels_all, test_preds_all)
+test_prec = precision_score(test_labels_all, test_preds_all, zero_division=0)
+test_rec  = recall_score(test_labels_all, test_preds_all, zero_division=0)
+test_f1   = f1_score(test_labels_all, test_preds_all, zero_division=0)
+
+wandb.log({
+    "test/accuracy": test_acc,
+    "test/precision": test_prec,
+    "test/recall": test_rec,
+    "test/f1": test_f1
+})
+
+print("\n📌 FINAL TEST RESULTS")
+print(f"Accuracy : {test_acc:.4f}")
+print(f"Precision: {test_prec:.4f}")
+print(f"Recall   : {test_rec:.4f}")
+print(f"F1-score : {test_f1:.4f}")
+
+wandb.finish()
